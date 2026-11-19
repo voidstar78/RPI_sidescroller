@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<scrollerApp>
+  <window width="1280" height="240" background="#FFFFFF" />
+
+  <scroller speed="160"
+            startPadding="180"
+            endPadding="180"
+            repeatPauseMs="900"
+            clearFullyBeforeRepeat="true"
+            loopGap="140" />
+
+  <segment text="WELCOME TO THE EVENT" font="DejaVu Sans Mono" size="72" color="#000000" gapAfter="50" />
+  <segment text=" • " font="DejaVu Sans Mono" size="72" color="#666666" gapAfter="20" />
+  <segment text="SPECIAL GUEST ARRIVING SOON" font="DejaVu Serif" size="76" color="#C00000" gapAfter="50" />
+  <segment font="DejaVu Sans Mono" size="68" color="#0044AA" gapAfter="40">PLEASE TAKE YOUR SEATS</segment>
+</scrollerApp>

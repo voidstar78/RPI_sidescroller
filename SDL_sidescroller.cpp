@@ -1,3 +1,22 @@
+// side_scroller_sdl2.cpp
+// SDL2 + SDL_ttf horizontal text scroller with XML config
+//
+// Features:
+// - Resizable SDL window
+// - Per-segment text, font, size, color, gapAfter
+// - Long text split into smaller texture chunks to avoid max texture limits
+// - XML config reload with R
+// - Left/Right adjust speed
+// - Up/Down adjust runtime text scale
+// - Backspace toggles bordered/borderless window
+// - Optional "clear fully before repeat" mode or earlier restart with loop gap
+//
+// Build on Raspberry Pi OS:
+//   sudo apt update
+//   sudo apt install build-essential libsdl2-dev libsdl2-ttf-dev
+//   g++ -std=c++17 side_scroller_sdl2.cpp -o side_scroller \
+//       $(pkg-config --cflags --libs sdl2 SDL2_ttf)
+
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 
@@ -11,7 +30,6 @@
 #include <fstream>
 #include <iostream>
 #include <map>
-#include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -43,27 +61,32 @@ struct Config {
     int startPadding = 120;
     int endPadding = 120;
     int repeatPauseMs = 700;
-    double globalScale = 1.0;
+    bool clearFullyBeforeRepeat = true;
+    int loopGap = 120;
     std::vector<SegmentConfig> segments;
 };
 
 static void printUsage(const char* exe) {
     std::cout
-        << "Usage: " << exe << " [config.xml]" << std::endl 
+        << "Usage: " << exe << " [config.xml]" << std::endl
+        << std::endl
         << "If omitted, the program loads scroller_config.xml from the current folder." << std::endl
-        << "Keys:" << std::endl 
-        << "  Left/Right arrows  Decrease/increase speed" << std::endl 
-        << "  Up/Down arrows     Increase/decrease text scale" << std::endl 
-        << "  Space              Pause/resume scrolling" << std::endl 
-        << "  R                  Reload XML config" << std::endl 
+        << std::endl
+        << "Keys:" << std::endl
+        << "  Left/Right arrows  Decrease/increase speed" << std::endl
+        << "  Up/Down arrows     Increase/decrease text scale" << std::endl
+        << "  Space              Pause/resume scrolling" << std::endl
+        << "  Backspace          Toggle bordered/borderless window" << std::endl
+        << "  R                  Reload XML config" << std::endl
         << "  Esc or close       Quit" << std::endl;
 }
 
 static std::string trim(const std::string& s) {
-    const auto first = s.find_first_not_of(" ");
-    if (first == std::string::npos) return "";
-    const auto last = s.find_last_not_of(" ");
-    return s.substr(first, last - first + 1);
+    auto isWs = [](unsigned char c) { return std::isspace(c) != 0; };
+    auto first = std::find_if_not(s.begin(), s.end(), isWs);
+    if (first == s.end()) return "";
+    auto last = std::find_if_not(s.rbegin(), s.rend(), isWs).base();
+    return std::string(first, last);
 }
 
 static std::string toLower(std::string s) {
@@ -107,8 +130,12 @@ static std::map<std::string, std::string> parseAttributes(const std::string& tag
         if (tagInside[i] == '/' || tagInside[i] == '>') break;
 
         std::size_t keyStart = i;
-        while (i < tagInside.size() && tagInside[i] != '=' && !std::isspace(static_cast<unsigned char>(tagInside[i]))) ++i;
+        while (i < tagInside.size() && tagInside[i] != '=' &&
+               !std::isspace(static_cast<unsigned char>(tagInside[i]))) {
+            ++i;
+        }
         std::string key = tagInside.substr(keyStart, i - keyStart);
+
         while (i < tagInside.size() && std::isspace(static_cast<unsigned char>(tagInside[i]))) ++i;
         if (i >= tagInside.size() || tagInside[i] != '=') break;
         ++i;
@@ -118,6 +145,7 @@ static std::map<std::string, std::string> parseAttributes(const std::string& tag
         char quote = tagInside[i];
         if (quote != '"' && quote != '\'') break;
         ++i;
+
         std::size_t valueStart = i;
         while (i < tagInside.size() && tagInside[i] != quote) ++i;
         std::string value = tagInside.substr(valueStart, i - valueStart);
@@ -129,7 +157,10 @@ static std::map<std::string, std::string> parseAttributes(const std::string& tag
     return attrs;
 }
 
-static std::optional<std::string> getAttribute(const std::map<std::string, std::string>& attrs, const std::string& key) {
+static std::optional<std::string> getAttribute(
+    const std::map<std::string, std::string>& attrs,
+    const std::string& key) {
+
     auto it = attrs.find(toLower(key));
     if (it == attrs.end()) return std::nullopt;
     return it->second;
@@ -167,26 +198,16 @@ static Color parseColor(const std::optional<std::string>& value, Color fallback)
 static std::string readFileText(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
-        throw std::runtime_error("Could not open file: " + path + " (" + std::strerror(errno) + ")");
+        throw std::runtime_error(
+            "Could not open file: " + path + " (" + std::strerror(errno) + ")");
     }
     std::ostringstream ss;
     ss << in.rdbuf();
     return ss.str();
 }
 
-static std::string extractTagContent(const std::string& xml, const std::string& tagName) {
-    const std::string openTag = "<" + tagName;
-    const std::string closeTag = "</" + tagName + ">";
-    std::size_t openPos = xml.find(openTag);
-    if (openPos == std::string::npos) return "";
-    std::size_t openEnd = xml.find('>', openPos);
-    if (openEnd == std::string::npos) return "";
-    std::size_t closePos = xml.find(closeTag, openEnd + 1);
-    if (closePos == std::string::npos) return "";
-    return xml.substr(openEnd + 1, closePos - (openEnd + 1));
-}
-
-static std::vector<std::pair<std::map<std::string, std::string>, std::string>> extractSegmentTags(const std::string& xml) {
+static std::vector<std::pair<std::map<std::string, std::string>, std::string>>
+extractSegmentTags(const std::string& xml) {
     std::vector<std::pair<std::map<std::string, std::string>, std::string>> out;
     std::size_t pos = 0;
 
@@ -218,23 +239,26 @@ static std::vector<std::pair<std::map<std::string, std::string>, std::string>> e
 
 static Config loadConfig(const std::string& path) {
     Config cfg;
-    std::string xml = readFileText(path);
+    const std::string xml = readFileText(path);
 
-    std::string windowContent = extractTagContent(xml, "window");
-    if (!windowContent.empty()) {
-        std::size_t open = xml.find("<window");
-        if (open != std::string::npos) {
-            std::size_t end = xml.find('>', open);
-            if (end != std::string::npos) {
-                auto attrs = parseAttributes(xml.substr(open + 1, end - open - 1));
-                cfg.windowWidth = std::max(320, parseInt(getAttribute(attrs, "width"), cfg.windowWidth));
-                cfg.windowHeight = std::max(100, parseInt(getAttribute(attrs, "height"), cfg.windowHeight));
-                cfg.background = parseColor(getAttribute(attrs, "background"), cfg.background);
-            }
+    std::size_t windowOpen = xml.find("<window ");
+    if (windowOpen == std::string::npos) {
+        windowOpen = xml.find("<window>");
+    }
+    if (windowOpen != std::string::npos) {
+        std::size_t windowEnd = xml.find('>', windowOpen);
+        if (windowEnd != std::string::npos) {
+            auto attrs = parseAttributes(xml.substr(windowOpen + 1, windowEnd - windowOpen - 1));
+            cfg.windowWidth = std::max(320, parseInt(getAttribute(attrs, "width"), cfg.windowWidth));
+            cfg.windowHeight = std::max(100, parseInt(getAttribute(attrs, "height"), cfg.windowHeight));
+            cfg.background = parseColor(getAttribute(attrs, "background"), cfg.background);
         }
     }
 
-    std::size_t scrollerOpen = xml.find("<scroller");
+    std::size_t scrollerOpen = xml.find("<scroller ");
+    if (scrollerOpen == std::string::npos) {
+        scrollerOpen = xml.find("<scroller>");
+    }
     if (scrollerOpen != std::string::npos) {
         std::size_t scrollerEnd = xml.find('>', scrollerOpen);
         if (scrollerEnd != std::string::npos) {
@@ -243,7 +267,11 @@ static Config loadConfig(const std::string& path) {
             cfg.startPadding = std::max(0, parseInt(getAttribute(attrs, "startPadding"), cfg.startPadding));
             cfg.endPadding = std::max(0, parseInt(getAttribute(attrs, "endPadding"), cfg.endPadding));
             cfg.repeatPauseMs = std::max(0, parseInt(getAttribute(attrs, "repeatPauseMs"), cfg.repeatPauseMs));
-            cfg.globalScale = std::max(0.2, parseDouble(getAttribute(attrs, "scale"), cfg.globalScale));
+            if (auto v = getAttribute(attrs, "clearFullyBeforeRepeat")) {
+                const std::string s = toLower(trim(*v));
+                cfg.clearFullyBeforeRepeat = (s == "1" || s == "true" || s == "yes" || s == "on");
+            }
+            cfg.loopGap = std::max(0, parseInt(getAttribute(attrs, "loopGap"), cfg.loopGap));
         }
     }
 
@@ -258,7 +286,6 @@ static Config loadConfig(const std::string& path) {
         seg.color = parseColor(getAttribute(attrs, "color"), seg.color);
         seg.gapAfter = std::max(0, parseInt(getAttribute(attrs, "gapAfter"), seg.gapAfter));
         if (!trim(seg.text).empty()) {
-            seg.text = xmlUnescape(seg.text);
             cfg.segments.push_back(seg);
         }
     }
@@ -338,7 +365,10 @@ public:
     FontHandle(const FontHandle&) = delete;
     FontHandle& operator=(const FontHandle&) = delete;
 
-    FontHandle(FontHandle&& other) noexcept : font_(other.font_) { other.font_ = nullptr; }
+    FontHandle(FontHandle&& other) noexcept : font_(other.font_) {
+        other.font_ = nullptr;
+    }
+
     FontHandle& operator=(FontHandle&& other) noexcept {
         if (this != &other) {
             reset();
@@ -368,7 +398,10 @@ public:
     TextureHandle(const TextureHandle&) = delete;
     TextureHandle& operator=(const TextureHandle&) = delete;
 
-    TextureHandle(TextureHandle&& other) noexcept : texture_(other.texture_) { other.texture_ = nullptr; }
+    TextureHandle(TextureHandle&& other) noexcept : texture_(other.texture_) {
+        other.texture_ = nullptr;
+    }
+
     TextureHandle& operator=(TextureHandle&& other) noexcept {
         if (this != &other) {
             reset();
@@ -389,6 +422,12 @@ private:
     SDL_Texture* texture_ = nullptr;
 };
 
+struct RenderedChunk {
+    TextureHandle texture;
+    int width = 0;
+    int height = 0;
+};
+
 struct RenderedSegment {
     std::string text;
     std::string fontLabel;
@@ -397,23 +436,93 @@ struct RenderedSegment {
     int gapAfter = 24;
     int width = 0;
     int height = 0;
-    TextureHandle texture;
+    std::vector<RenderedChunk> chunks;
 };
 
-static int computeScaledFontSize(int windowHeight, int baseSize, double globalScale) {
-    int target = static_cast<int>(std::round(windowHeight * 0.60 * globalScale));
+static int computeScaledFontSize(int windowHeight, int baseSize, double userScale) {
+    int target = static_cast<int>(std::round(windowHeight * 0.60 * userScale));
     int boundedBase = std::max(8, baseSize);
-    return std::max(8, std::min(std::max(boundedBase, target), boundedBase * 6));
+    int finalSize = std::max(target, boundedBase);
+    return std::min(finalSize, boundedBase * 6);
+}
+
+static std::vector<std::string> splitTextToFitWidth(TTF_Font* font, const std::string& text, int maxWidth) {
+    std::vector<std::string> pieces;
+    if (text.empty()) {
+        pieces.push_back(" ");
+        return pieces;
+    }
+
+    std::size_t start = 0;
+    while (start < text.size()) {
+        std::size_t best = start + 1;
+        std::size_t low = start + 1;
+        std::size_t high = text.size();
+
+        while (low <= high) {
+            std::size_t mid = low + (high - low) / 2;
+            int w = 0;
+            int h = 0;
+            std::string candidate = text.substr(start, mid - start);
+            if (TTF_SizeUTF8(font, candidate.c_str(), &w, &h) != 0) {
+                break;
+            }
+            if (w <= maxWidth) {
+                best = mid;
+                low = mid + 1;
+            } else {
+                if (mid == 0) break;
+                high = mid - 1;
+            }
+        }
+
+        if (best <= start) {
+            best = start + 1;
+        }
+
+        std::size_t split = best;
+        if (best < text.size()) {
+            std::size_t lastSpace = text.rfind(' ', best - 1);
+            if (lastSpace != std::string::npos && lastSpace > start) {
+                split = lastSpace + 1;
+            }
+        }
+
+        std::string part = text.substr(start, split - start);
+        if (part.empty()) {
+            part = text.substr(start, 1);
+            split = start + 1;
+        }
+
+        pieces.push_back(part);
+        start = split;
+    }
+
+    return pieces;
 }
 
 static bool buildRenderedSegments(
     SDL_Renderer* renderer,
     const Config& cfg,
     int windowHeight,
+    double userScale,
     std::vector<RenderedSegment>& outSegments,
     std::string& errorMessage) {
 
     outSegments.clear();
+
+    int maxTextureWidth = 0;
+    int maxTextureHeight = 0;
+    SDL_RendererInfo info{};
+    if (SDL_GetRendererInfo(renderer, &info) == 0 && info.max_texture_width > 0) {
+        maxTextureWidth = info.max_texture_width;
+        maxTextureHeight = info.max_texture_height;
+    } else {
+        maxTextureWidth = 2048;
+        maxTextureHeight = 2048;
+    }
+
+    const int safeMaxWidth = std::max(256, maxTextureWidth - 64);
 
     for (const auto& seg : cfg.segments) {
         auto fontPathOpt = findFontByNameOrPath(seg.font);
@@ -422,26 +531,15 @@ static bool buildRenderedSegments(
             return false;
         }
 
-        int actualSize = computeScaledFontSize(windowHeight, seg.size, cfg.globalScale);
+        int actualSize = computeScaledFontSize(windowHeight, seg.size, userScale);
         FontHandle font(TTF_OpenFont(fontPathOpt->string().c_str(), actualSize));
         if (!font.get()) {
             errorMessage = std::string("TTF_OpenFont failed for '") + seg.font + "': " + TTF_GetError();
             return false;
         }
 
+        TTF_SetFontHinting(font.get(), TTF_HINTING_NORMAL);
         SDL_Color sdlColor{seg.color.r, seg.color.g, seg.color.b, seg.color.a};
-        SDL_Surface* surf = TTF_RenderUTF8_Blended(font.get(), seg.text.c_str(), sdlColor);
-        if (!surf) {
-            errorMessage = std::string("TTF_RenderUTF8_Blended failed: ") + TTF_GetError();
-            return false;
-        }
-
-        SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surf);
-        if (!texture) {
-            errorMessage = std::string("SDL_CreateTextureFromSurface failed: ") + SDL_GetError();
-            SDL_FreeSurface(surf);
-            return false;
-        }
 
         RenderedSegment rs;
         rs.text = seg.text;
@@ -449,10 +547,38 @@ static bool buildRenderedSegments(
         rs.requestedSize = actualSize;
         rs.color = seg.color;
         rs.gapAfter = seg.gapAfter;
-        rs.width = surf->w;
-        rs.height = surf->h;
-        rs.texture.reset(texture);
-        SDL_FreeSurface(surf);
+
+        auto parts = splitTextToFitWidth(font.get(), seg.text, safeMaxWidth);
+        for (const auto& part : parts) {
+            SDL_Surface* surf = TTF_RenderUTF8_Blended(font.get(), part.c_str(), sdlColor);
+            if (!surf) {
+                errorMessage = std::string("TTF_RenderUTF8_Blended failed: ") + TTF_GetError();
+                return false;
+            }
+
+            if (surf->w > maxTextureWidth || surf->h > maxTextureHeight) {
+                errorMessage = "Rendered text chunk still exceeds renderer texture limits.";
+                SDL_FreeSurface(surf);
+                return false;
+            }
+
+            SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surf);
+            if (!texture) {
+                errorMessage = std::string("SDL_CreateTextureFromSurface failed: ") + SDL_GetError();
+                SDL_FreeSurface(surf);
+                return false;
+            }
+
+            RenderedChunk chunk;
+            chunk.texture.reset(texture);
+            chunk.width = surf->w;
+            chunk.height = surf->h;
+            rs.width += surf->w;
+            rs.height = std::max(rs.height, surf->h);
+            rs.chunks.push_back(std::move(chunk));
+            SDL_FreeSurface(surf);
+        }
+
         outSegments.push_back(std::move(rs));
     }
 
@@ -461,12 +587,47 @@ static bool buildRenderedSegments(
 }
 
 static int totalRenderedWidth(const Config& cfg, const std::vector<RenderedSegment>& segments) {
-    int total = cfg.startPadding + cfg.endPadding;
+    int total = cfg.startPadding;
     for (const auto& seg : segments) {
         total += seg.width + seg.gapAfter;
     }
-    if (!segments.empty()) total -= segments.back().gapAfter;
+    if (!segments.empty()) {
+        total -= segments.back().gapAfter;
+    }
+    total += cfg.endPadding;
     return total;
+}
+
+static int repeatThresholdWidth(const Config& cfg, const std::vector<RenderedSegment>& segments, int windowW) {
+    const int contentWidth = totalRenderedWidth(cfg, segments);
+    if (cfg.clearFullyBeforeRepeat || contentWidth <= windowW) {
+        return contentWidth;
+    }
+    return std::max(0, contentWidth - windowW + cfg.loopGap);
+}
+
+static bool useSeamlessWrap(const Config& cfg, const std::vector<RenderedSegment>& segments, int windowW) {
+    return !cfg.clearFullyBeforeRepeat && totalRenderedWidth(cfg, segments) > windowW;
+}
+
+static void renderSingleCycle(
+    SDL_Renderer* renderer,
+    const Config& cfg,
+    const std::vector<RenderedSegment>& segments,
+    int windowH,
+    int baseX) {
+
+    int x = baseX + cfg.startPadding;
+    for (const auto& seg : segments) {
+        int chunkX = x;
+        for (const auto& chunk : seg.chunks) {
+            int y = (windowH - chunk.height) / 2;
+            SDL_Rect dst{chunkX, y, chunk.width, chunk.height};
+            SDL_RenderCopy(renderer, chunk.texture.get(), nullptr, &dst);
+            chunkX += chunk.width;
+        }
+        x += seg.width + seg.gapAfter;
+    }
 }
 
 static void renderFrame(
@@ -475,17 +636,20 @@ static void renderFrame(
     const std::vector<RenderedSegment>& segments,
     int windowW,
     int windowH,
-    double offsetX) {
+    double offsetX,
+    bool seamlessWrap) {
+
+    (void)windowW;
 
     SDL_SetRenderDrawColor(renderer, cfg.background.r, cfg.background.g, cfg.background.b, cfg.background.a);
     SDL_RenderClear(renderer);
 
-    int x = static_cast<int>(std::round(offsetX)) + cfg.startPadding;
-    for (const auto& seg : segments) {
-        int y = (windowH - seg.height) / 2;
-        SDL_Rect dst{x, y, seg.width, seg.height};
-        SDL_RenderCopy(renderer, seg.texture.get(), nullptr, &dst);
-        x += seg.width + seg.gapAfter;
+    const int cycleWidth = totalRenderedWidth(cfg, segments);
+    const int baseX = static_cast<int>(std::round(offsetX));
+    renderSingleCycle(renderer, cfg, segments, windowH, baseX);
+
+    if (seamlessWrap) {
+        renderSingleCycle(renderer, cfg, segments, windowH, baseX + cycleWidth + cfg.loopGap);
     }
 
     SDL_RenderPresent(renderer);
@@ -521,6 +685,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    bool borderless = false;
+
     SDL_Window* window = SDL_CreateWindow(
         "Side Scroller",
         SDL_WINDOWPOS_CENTERED,
@@ -555,10 +721,11 @@ int main(int argc, char** argv) {
     bool waitingToRepeat = false;
     Uint32 repeatPauseStartTicks = 0;
     double speed = cfg.pixelsPerSecond;
+    double userScale = 1.0;
 
     std::vector<RenderedSegment> renderedSegments;
     std::string errorMessage;
-    if (!buildRenderedSegments(renderer, cfg, windowH, renderedSegments, errorMessage)) {
+    if (!buildRenderedSegments(renderer, cfg, windowH, userScale, renderedSegments, errorMessage)) {
         std::cerr << errorMessage << std::endl;
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
@@ -583,7 +750,7 @@ int main(int argc, char** argv) {
                     if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                         windowW = e.window.data1;
                         windowH = e.window.data2;
-                        if (!buildRenderedSegments(renderer, cfg, windowH, renderedSegments, errorMessage)) {
+                        if (!buildRenderedSegments(renderer, cfg, windowH, userScale, renderedSegments, errorMessage)) {
                             std::cerr << errorMessage << std::endl;
                             running = false;
                         }
@@ -598,6 +765,10 @@ int main(int argc, char** argv) {
                         case SDLK_SPACE:
                             paused = !paused;
                             break;
+                        case SDLK_BACKSPACE:
+                            borderless = !borderless;
+                            SDL_SetWindowBordered(window, borderless ? SDL_FALSE : SDL_TRUE);
+                            break;
                         case SDLK_LEFT:
                             speed = std::max(5.0, speed - 20.0);
                             break;
@@ -605,25 +776,24 @@ int main(int argc, char** argv) {
                             speed = std::min(3000.0, speed + 20.0);
                             break;
                         case SDLK_UP:
-                            cfg.globalScale = std::min(4.0, cfg.globalScale + 0.10);
-                            if (!buildRenderedSegments(renderer, cfg, windowH, renderedSegments, errorMessage)) {
+                            userScale = std::min(4.0, userScale + 0.10);
+                            if (!buildRenderedSegments(renderer, cfg, windowH, userScale, renderedSegments, errorMessage)) {
                                 std::cerr << errorMessage << std::endl;
                                 running = false;
                             }
                             break;
                         case SDLK_DOWN:
-                            cfg.globalScale = std::max(0.20, cfg.globalScale - 0.10);
-                            if (!buildRenderedSegments(renderer, cfg, windowH, renderedSegments, errorMessage)) {
+                            userScale = std::max(0.20, userScale - 0.10);
+                            if (!buildRenderedSegments(renderer, cfg, windowH, userScale, renderedSegments, errorMessage)) {
                                 std::cerr << errorMessage << std::endl;
                                 running = false;
                             }
                             break;
                         case SDLK_r:
-                        //case SDLK_R:
                             try {
                                 cfg = loadConfig(configPath);
                                 speed = cfg.pixelsPerSecond;
-                                if (!buildRenderedSegments(renderer, cfg, windowH, renderedSegments, errorMessage)) {
+                                if (!buildRenderedSegments(renderer, cfg, windowH, userScale, renderedSegments, errorMessage)) {
                                     std::cerr << errorMessage << std::endl;
                                     running = false;
                                 }
@@ -644,24 +814,35 @@ int main(int argc, char** argv) {
         lastCounter = nowCounter;
 
         const int contentWidth = totalRenderedWidth(cfg, renderedSegments);
+        const int thresholdWidth = repeatThresholdWidth(cfg, renderedSegments, windowW);
+        const bool seamlessWrap = useSeamlessWrap(cfg, renderedSegments, windowW);
 
         if (!paused) {
-            if (waitingToRepeat) {
-                Uint32 elapsed = SDL_GetTicks() - repeatPauseStartTicks;
-                if (elapsed >= static_cast<Uint32>(cfg.repeatPauseMs)) {
-                    offsetX = static_cast<double>(windowW);
-                    waitingToRepeat = false;
-                }
-            } else {
+            if (seamlessWrap) {
                 offsetX -= speed * dt;
-                if (offsetX + contentWidth < 0.0) {
-                    waitingToRepeat = true;
-                    repeatPauseStartTicks = SDL_GetTicks();
+                const double wrapWidth = static_cast<double>(contentWidth + cfg.loopGap);
+                while (offsetX + wrapWidth < 0.0) {
+                    offsetX += wrapWidth;
+                }
+                waitingToRepeat = false;
+            } else {
+                if (waitingToRepeat) {
+                    Uint32 elapsed = SDL_GetTicks() - repeatPauseStartTicks;
+                    if (elapsed >= static_cast<Uint32>(cfg.repeatPauseMs)) {
+                        offsetX = static_cast<double>(windowW);
+                        waitingToRepeat = false;
+                    }
+                } else {
+                    offsetX -= speed * dt;
+                    if (offsetX + thresholdWidth < 0.0) {
+                        waitingToRepeat = true;
+                        repeatPauseStartTicks = SDL_GetTicks();
+                    }
                 }
             }
         }
 
-        renderFrame(renderer, cfg, renderedSegments, windowW, windowH, offsetX);
+        renderFrame(renderer, cfg, renderedSegments, windowW, windowH, offsetX, seamlessWrap);
     }
 
     SDL_DestroyRenderer(renderer);
@@ -670,33 +851,3 @@ int main(int argc, char** argv) {
     SDL_Quit();
     return 0;
 }
-
-/*
-Example XML file: scroller_config.xml
-
-<?xml version="1.0" encoding="UTF-8"?>
-<scrollerApp>
-  <window width="1280" height="240" background="#FFFFFF" />
-
-  <scroller speed="160"
-            startPadding="180"
-            endPadding="180"
-            repeatPauseMs="900"
-            scale="1.0" />
-
-  <segment text="WELCOME TO THE EVENT" font="DejaVu Sans Mono" size="72" color="#000000" gapAfter="50" />
-  <segment text=" • " font="DejaVu Sans Mono" size="72" color="#666666" gapAfter="20" />
-  <segment text="SPECIAL GUEST ARRIVING SOON" font="DejaVu Serif" size="76" color="#C00000" gapAfter="50" />
-  <segment font="DejaVu Sans Mono" size="68" color="#0044AA" gapAfter="40">PLEASE TAKE YOUR SEATS</segment>
-</scrollerApp>
-
-Build on Raspberry Pi OS:
-  sudo apt update
-  sudo apt install build-essential libsdl2-dev libsdl2-ttf-dev
-  g++ -std=c++17 side_scroller_sdl2.cpp -o side_scroller $(pkg-config --cflags --libs sdl2 SDL2_ttf)
-
-Run:
-  ./side_scroller
-or:
-  ./side_scroller my_config.xml
-*/
