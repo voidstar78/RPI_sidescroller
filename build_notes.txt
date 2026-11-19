@@ -1,0 +1,7 @@
+sudo apt update
+sudo apt install build-essential libsdl2-dev libsdl2-ttf-dev
+g++ -std=c++17 side_scroller_sdl2.cpp -o side_scroller $(pkg-config --cflags --libs sdl2 SDL2_ttf)
+
+run instructions:
+
+./side_scroller --text scroll.txt --font "DejaVu Sans Mono" --height 260 --speed 160
